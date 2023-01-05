@@ -8,25 +8,23 @@ const FILE_NAME_REGEX = /^(\d+)_\S+\.js$/;
  * Gets migration status for a given app.
  * @param {*} driver neo4j bolt driver
  * @param {*} appName app to check migration status for
- * @param database database to run migrations on
  * @returns object with keys: app, migration.
  */
-async function migrationStatus(driver, appName, database) {
-  let migrationHistory;
-  try {
-    const session = driver.session({database});
-    migrationHistory = await session.run(
-      'MATCH (m:__dm {app: $appName }) RETURN PROPERTIES(m) AS migration',
+function migrationStatus(driver, appName) {
+  return new Promise((resolve, reject) => {
+    const session = driver.session();
+    session.run(
+      'MATCH (m:__dm {app: {appName} }) RETURN PROPERTIES(m) AS migration',
       { appName },
-    );
-    await session.close();
-  } catch (err) {
-    console.error(err);
-  }
-
-  return migrationHistory.records
-    .map(record => record.get('migration'))
-    .sort((a, b) => a.migration.localeCompare(b.migration));
+    ).then((migrationHistory) => {
+      session.close();
+      resolve(migrationHistory.records
+        .map(record => record.get('migration'))
+        .sort((a, b) => a.migration.localeCompare(b.migration)));
+      
+    })
+      .catch(reject);
+  });
 }
 
 /**
@@ -34,20 +32,19 @@ async function migrationStatus(driver, appName, database) {
  * @param {*} driver neo4j bolt driver
  * @param {*} appName app to add migation node for
  * @param {*} migration the migration number
- * @param database database to run migrations on
  * @returns none
  */
-async function forwardMigration(driver, appName, migration, database) {
-  try {
-    const session = driver.session({database});
-    await session.run(
-      'CREATE (m:__dm {app: $appName, migration: $migration})',
+function forwardMigration(driver, appName, migration) {
+  return new Promise((resolve) => {
+    const session = driver.session();
+    session.run(
+      'CREATE (m:__dm {app: {appName}, migration: {migration}})',
       { appName, migration },
-    );
-    await session.close();
-  } catch (err) {
-    console.error(err);
-  }
+    ).then(() => {
+      resolve()
+      session.close();
+    }).catch(console.error);
+  });
 }
 
 /**
@@ -55,20 +52,19 @@ async function forwardMigration(driver, appName, migration, database) {
  * @param {*} driver neo4j bolt driver
  * @param {*} appName app to add migation node for
  * @param {*} migration the migration number
- * @param database database to run migrations on
  * @returns none
  */
-async function backwardMigration(driver, appName, migration, database) {
-  try {
-    const session = driver.session({database});
-    await session.run(
-      'MATCH (m:__dm {app: $appName, migration: $migration}) DELETE m',
+function backwardMigration(driver, appName, migration) {
+  return new Promise((resolve) => {
+    const session = driver.session();
+    session.run(
+      'MATCH (m:__dm {app: {appName}, migration: {migration}}) DELETE m',
       { appName, migration },
-    );
-    await session.close();
-  } catch (err) {
-    console.error(err);
-  }
+    ).then(() => {
+      session.close();
+      resolve();
+    }).catch(console.error);
+  });
 }
 
 /**
@@ -154,10 +150,9 @@ Migrate.prototype.setup = function (dir) {
 /**
  * Configures the neo4j bolt driver.
  * @param {String} dir path to migrations directory
- * @param {String} database database to run migrations on
  * @returns {bool}
  */
-Migrate.prototype.configure = function (dir, database) {
+Migrate.prototype.configure = function (dir) {
   assert.ok(dir);
   const configPath = path.resolve(dir, 'configuration.js');
   if (!fs.existsSync(configPath)) {
@@ -176,7 +171,6 @@ Migrate.prototype.configure = function (dir, database) {
 
   this.configPath = dir;
   this.apps = readDirs(dir);
-  this.database = database;
   return true;
 };
 
@@ -204,7 +198,7 @@ Migrate.prototype.destroy = function () {
 Migrate.prototype.status = async function (appName) {
   assert(appName);
   assert(this.configPath);
-  return migrationStatus(this.driver, appName, this.database);
+  return migrationStatus(this.driver, appName);
 };
 
 
@@ -229,7 +223,7 @@ Migrate.prototype.all = async function () {
  * @param {String} prefix the prefix number to migrate to
  * @returns {Number} number of migrations applied.
  */
-Migrate.prototype.app = async function (appName, prefix) {
+Migrate.prototype.app = async function (appName, prefix, appDirection = 1) {
   assert(appName);
   assert(this.configPath);
 
@@ -239,13 +233,16 @@ Migrate.prototype.app = async function (appName, prefix) {
     return 0;
   }
 
-  const dbMigrationStatus = await migrationStatus(this.driver, appName, this.database);
+  const dbMigrationStatus = await migrationStatus(this.driver, appName);
+
   const migrationFiles = readFiles(path.join(this.configPath, appName));
   const dbTip = dbMigrationStatus[dbMigrationStatus.length - 1] || { migration: '0' }; // latest migration in DB
   const filesTip = migrationFiles[migrationFiles.length - 1]; // latest file migration
   const tipDiff = dbTip.migration.localeCompare(filesTip.migration);
   let target = filesTip;
-  let direction = 0;
+
+
+  let direction = appDirection;
   let migrations = [];
 
   if (!prefix) {
@@ -261,8 +258,10 @@ Migrate.prototype.app = async function (appName, prefix) {
   }
 
   // is -1 for backwards, 1 for forwards, 0 for up-to-date
-  direction = target.localeCompare(dbTip.migration);
 
+
+  direction = target.localeCompare(dbTip.migration);
+  
   // if the DB is ahead of the migration files, do nothing.
   if (tipDiff > 0) {
     console.info(`App '${appName}' is ahead of the migration files.`);
@@ -283,6 +282,7 @@ Migrate.prototype.app = async function (appName, prefix) {
   }
 
   // migrate backwards.
+
   if (direction < 0) {
     migrations = migrationFiles
       .filter(file => file.migration <= dbTip.migration && file.migration > target)
@@ -315,10 +315,10 @@ Migrate.prototype.app = async function (appName, prefix) {
     console.info(` - ${migration.migration}: ${migration.fn.name}`);
     if (direction > 0) {
       await migration.fn.forward(this.driver);
-      await forwardMigration(this.driver, appName, migration.migration, this.database);
+      await forwardMigration(this.driver, appName, migration.migration);
     } else {
       await migration.fn.backward(this.driver);
-      await backwardMigration(this.driver, appName, migration.migration, this.database);
+      await backwardMigration(this.driver, appName, migration.migration);
     }
     /* eslint-enable no-await-in-loop */
   }
